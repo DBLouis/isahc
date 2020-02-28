@@ -23,6 +23,7 @@ use std::{
     sync::Arc,
     task::{Context, Poll},
 };
+use tracing_futures::Instrument;
 
 lazy_static! {
     static ref USER_AGENT: String = format!(
@@ -243,6 +244,7 @@ impl HttpClientBuilder {
     /// Build an [`HttpClient`] using the configured options.
     ///
     /// If the client fails to initialize, an error will be returned.
+    #[tracing::instrument(skip(self))]
     pub fn build(self) -> Result<HttpClient, Error> {
         Ok(HttpClient {
             agent: Arc::new(self.agent_builder.spawn()?),
@@ -349,6 +351,7 @@ impl HttpClient {
     /// Create a new HTTP client using the default configuration.
     ///
     /// If the client fails to initialize, an error will be returned.
+    #[tracing::instrument]
     pub fn new() -> Result<Self, Error> {
         HttpClientBuilder::default().build()
     }
@@ -356,6 +359,7 @@ impl HttpClient {
     /// Get a reference to a global client instance.
     ///
     /// TODO: Stabilize.
+    #[tracing::instrument]
     pub(crate) fn shared() -> &'static Self {
         lazy_static! {
             static ref SHARED: HttpClient =
@@ -593,6 +597,7 @@ impl HttpClient {
     /// # Ok::<(), isahc::Error>(())
     /// ```
     #[inline]
+    #[tracing::instrument(skip(self, request))]
     pub fn send<B: Into<Body>>(&self, request: Request<B>) -> Result<Response<Body>, Error> {
         self.send_async(request).join()
     }
@@ -621,9 +626,16 @@ impl HttpClient {
     /// # Ok(()) }
     /// ```
     pub fn send_async<B: Into<Body>>(&self, request: Request<B>) -> ResponseFuture<'_> {
-        let request = request.map(Into::into);
+        tracing::info_span!(
+            "send_async",
+            method = ?request.method(),
+            uri = ?request.uri(),
+        )
+        .in_scope(move || {
+            let request = request.map(Into::into);
 
-        ResponseFuture::new(self.send_async_inner(request))
+            ResponseFuture::new(self.send_async_inner(request).in_current_span())
+        })
     }
 
     fn send_builder_async(
@@ -631,7 +643,9 @@ impl HttpClient {
         builder: http::request::Builder,
         body: Body,
     ) -> ResponseFuture<'_> {
-        ResponseFuture::new(async move { self.send_async_inner(builder.body(body)?).await })
+        ResponseFuture::new(
+            async move { self.send_async_inner(builder.body(body)?).await }.in_current_span(),
+        )
     }
 
     /// Actually send the request. All the public methods go through here.
@@ -689,7 +703,6 @@ impl HttpClient {
         Ok(response)
     }
 
-    #[allow(clippy::cognitive_complexity)]
     fn create_easy_handle(
         &self,
         request: Request<Body>,
@@ -708,7 +721,9 @@ impl HttpClient {
 
         let mut easy = curl::easy::Easy2::new(handler);
 
-        easy.verbose(log::log_enabled!(log::Level::Debug))?;
+        // easy.verbose(log::log_enabled!(log::Level::Debug))?;
+        // easy.verbose(!tracing::debug_span!("verbose").is_disabled())?;
+        easy.verbose(true)?;
         easy.signal(false)?;
 
         // Macro to apply all config values given in the request or in defaults.
