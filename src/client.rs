@@ -6,6 +6,7 @@ use crate::{
     config::internal::{ConfigurableBase, SetOpt},
     config::*,
     handler::{RequestHandler, ResponseBodyReader},
+    interceptors::{self, Interceptor},
     middleware::Middleware,
     task::Join,
     Body, Error,
@@ -57,6 +58,7 @@ lazy_static! {
 pub struct HttpClientBuilder {
     agent_builder: AgentBuilder,
     defaults: http::Extensions,
+    interceptors: Vec<Box<dyn Interceptor>>,
     middleware: Vec<Box<dyn Middleware>>,
 }
 
@@ -83,6 +85,7 @@ impl HttpClientBuilder {
         Self {
             agent_builder: AgentBuilder::default(),
             defaults,
+            interceptors: Vec::new(),
             middleware: Vec::new(),
         }
     }
@@ -96,6 +99,12 @@ impl HttpClientBuilder {
     #[cfg(feature = "cookies")]
     pub fn cookies(self) -> Self {
         self.middleware_impl(crate::cookies::CookieJar::default())
+    }
+
+    /// Add a request interceptor to the client.
+    pub fn interceptor(mut self, interceptor: impl Interceptor) -> Self {
+        self.interceptors.push(Box::new(interceptor));
+        self
     }
 
     /// Add a middleware layer to the client.
@@ -247,6 +256,7 @@ impl HttpClientBuilder {
         Ok(HttpClient {
             agent: Arc::new(self.agent_builder.spawn()?),
             defaults: self.defaults,
+            interceptors: self.interceptors,
             middleware: self.middleware,
         })
     }
@@ -338,9 +348,14 @@ impl fmt::Debug for HttpClientBuilder {
 pub struct HttpClient {
     /// This is how we talk to our background agent thread.
     agent: Arc<agent::Handle>,
+
     /// Map of config values that should be used to configure execution if not
     /// specified in a request.
     defaults: http::Extensions,
+
+    /// Registered interceptors that requests should pass through.
+    interceptors: Vec<Box<dyn Interceptor>>,
+
     /// Any middleware implementations that requests should pass through.
     middleware: Vec<Box<dyn Middleware>>,
 }
@@ -647,38 +662,45 @@ impl HttpClient {
             request = middleware.filter_request(request);
         }
 
-        // Create and configure a curl easy handle to fulfil the request.
-        let (easy, future) = self.create_easy_handle(request)?;
+        let mut context = interceptors::Context {
+            invoker: Arc::new(|request: Request<Body>| Box::pin(async {
+                // Create and configure a curl easy handle to fulfil the request.
+                let (easy, future) = self.create_easy_handle(request)?;
 
-        // Send the request to the agent to be executed.
-        self.agent.submit_request(easy)?;
+                // Send the request to the agent to be executed.
+                self.agent.submit_request(easy)?;
 
-        // Await for the response headers.
-        let response = future.await?;
+                // Await for the response headers.
+                let response = future.await?;
 
-        // If a Content-Length header is present, include that information in
-        // the body as well.
-        let content_length = response
-            .headers()
-            .get(http::header::CONTENT_LENGTH)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok());
+                // If a Content-Length header is present, include that information in
+                // the body as well.
+                let content_length = response
+                    .headers()
+                    .get(http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse().ok());
 
-        // Convert the reader into an opaque Body.
-        let mut response = response.map(|reader| {
-            let body = ResponseBody {
-                inner: reader,
-                // Extend the lifetime of the agent by including a reference
-                // to its handle in the response body.
-                _agent: self.agent.clone(),
-            };
+                // Convert the reader into an opaque Body.
+                Ok(response.map(|reader| {
+                    let body = ResponseBody {
+                        inner: reader,
+                        // Extend the lifetime of the agent by including a reference
+                        // to its handle in the response body.
+                        _agent: self.agent.clone(),
+                    };
 
-            if let Some(len) = content_length {
-                Body::from_reader_sized(body, len)
-            } else {
-                Body::from_reader(body)
-            }
-        });
+                    if let Some(len) = content_length {
+                        Body::from_reader_sized(body, len)
+                    } else {
+                        Body::from_reader(body)
+                    }
+                }))
+            })),
+            interceptors: &self.interceptors,
+        };
+
+        let mut response = context.send(request).await?;
 
         // Apply response middleware, starting with the innermost
         // one.
